@@ -343,4 +343,131 @@ mod tests {
         client.transfer_admin(&new_admin);
         assert_eq!(client.get_admin().unwrap(), new_admin);
     }
+
+    #[test]
+    fn test_submit_price_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 5000);
+        let (_, client) = setup(&env);
+
+        let base = Symbol::new(&env, "XLM");
+        let quote = Symbol::new(&env, "USDC");
+        let price = 15_000_000; // 1.5 USDC per XLM
+
+        // Submit price which should emit event
+        client.submit_price(&base, &quote, &price);
+
+        // Verify event was emitted
+        let events = env.events().all();
+        let expected_event_topic = (Symbol::new(&env, "price_updated"),);
+        let expected_event_data = (base.clone(), quote.clone(), price, 5000u64);
+
+        // Check that at least one event matches our expectations
+        let found = events.iter().any(|(topic, data)| {
+            if let Ok(t) = topic.clone().try_into::<(Symbol,)>() {
+                if t == expected_event_topic {
+                    if let Ok(d) = data.clone().try_into::<(Symbol, Symbol, i128, u64)>() {
+                        return d == expected_event_data;
+                    }
+                }
+            }
+            false
+        });
+
+        assert!(found, "Expected price_updated event not found");
+    }
+
+    #[test]
+    fn test_submit_price_event_contains_correct_data() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 10000);
+        let (_, client) = setup(&env);
+
+        let base = Symbol::new(&env, "BTC");
+        let quote = Symbol::new(&env, "EUR");
+        let price = 50_000_000_000; // 50000 EUR per BTC
+
+        client.submit_price(&base, &quote, &price);
+
+        let events = env.events().all();
+
+        // Verify event topic contains "price_updated"
+        let price_updated_events: Vec<_> = events
+            .iter()
+            .filter_map(|(topic, data)| {
+                if let Ok((event_name,)) = topic.clone().try_into::<(Symbol,)>() {
+                    if event_name == Symbol::new(&env, "price_updated") {
+                        return Some((event_name, data.clone()));
+                    }
+                }
+                None
+            })
+            .collect();
+
+        assert!(!price_updated_events.is_empty(), "No price_updated events found");
+
+        // Verify the event data contains the correct values
+        let found_correct_data = price_updated_events.iter().any(|(_, data)| {
+            if let Ok((evt_base, evt_quote, evt_price, evt_timestamp)) =
+                data.clone().try_into::<(Symbol, Symbol, i128, u64)>()
+            {
+                return evt_base == base
+                    && evt_quote == quote
+                    && evt_price == price
+                    && evt_timestamp == 10000;
+            }
+            false
+        });
+
+        assert!(
+            found_correct_data,
+            "Event data does not match: expected base={}, quote={}, price={}, timestamp=10000",
+            base,
+            quote,
+            price
+        );
+    }
+
+    #[test]
+    fn test_multiple_price_submissions_emit_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+
+        let base1 = Symbol::new(&env, "XLM");
+        let quote1 = Symbol::new(&env, "USDC");
+        let price1 = 1_000_000;
+
+        let base2 = Symbol::new(&env, "BTC");
+        let quote2 = Symbol::new(&env, "USDC");
+        let price2 = 70_000_000_000;
+
+        env.ledger().with_mut(|l| l.timestamp = 1000);
+        client.submit_price(&base1, &quote1, &price1);
+
+        env.ledger().with_mut(|l| l.timestamp = 2000);
+        client.submit_price(&base2, &quote2, &price2);
+
+        let events = env.events().all();
+
+        // Count price_updated events
+        let price_events_count = events
+            .iter()
+            .filter(|(topic, _)| {
+                if let Ok((event_name,)) = topic.clone().try_into::<(Symbol,)>() {
+                    event_name == Symbol::new(&env, "price_updated")
+                } else {
+                    false
+                }
+            })
+            .count();
+
+        assert!(
+            price_events_count >= 2,
+            "Expected at least 2 price_updated events, found {}",
+            price_events_count
+        );
+    }
 }
