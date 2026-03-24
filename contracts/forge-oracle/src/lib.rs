@@ -461,12 +461,12 @@ mod tests {
 
         // At exact boundary
         env.ledger().with_mut(|l| l.timestamp = submit_time + threshold);
-        let data = client.get_price_unsafe(&base, &quote).unwrap();
+        let data = client.get_price_unsafe(&base, &quote);
         assert_eq!(data.price, price);
 
         // One second past boundary
         env.ledger().with_mut(|l| l.timestamp = submit_time + threshold + 1);
-        let data = client.get_price_unsafe(&base, &quote).unwrap();
+        let data = client.get_price_unsafe(&base, &quote);
         assert_eq!(data.price, price);
     }
 
@@ -492,5 +492,42 @@ mod tests {
             })
             .count();
         assert!(count >= 2, "Expected at least 2 price_updated events, found {}", count);
+    }
+
+    /// Verify that submitting a new price for an existing pair overwrites the old one.
+    /// This ensures stale prices are not retained.
+    #[test]
+    fn test_price_update_overwrites_previous_price() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+
+        let base = Symbol::new(&env, "XLM");
+        let quote = Symbol::new(&env, "USDC");
+
+        // Submit initial price at timestamp 1000
+        env.ledger().with_mut(|l| l.timestamp = 1000);
+        let initial_price = 10_000_000i128; // 1.0 USDC per XLM
+        client.submit_price(&base, &quote, &initial_price);
+
+        // Verify initial price is stored
+        let data = client.get_price(&base, &quote);
+        assert_eq!(data.price, initial_price);
+        assert_eq!(data.updated_at, 1000);
+
+        // Submit new price for the same pair at timestamp 2000
+        env.ledger().with_mut(|l| l.timestamp = 2000);
+        let new_price = 15_000_000i128; // 1.5 USDC per XLM
+        client.submit_price(&base, &quote, &new_price);
+
+        // Verify get_price() returns the new price, not the old one
+        let data = client.get_price(&base, &quote);
+        assert_eq!(data.price, new_price, "Expected new price to overwrite old price");
+        assert_eq!(data.updated_at, 2000, "Expected timestamp to be updated");
+
+        // Also verify with get_price_unsafe
+        let data_unsafe = client.get_price_unsafe(&base, &quote);
+        assert_eq!(data_unsafe.price, new_price);
+        assert_eq!(data_unsafe.updated_at, 2000);
     }
 }
