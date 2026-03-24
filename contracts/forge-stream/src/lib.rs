@@ -18,6 +18,7 @@ use soroban_sdk::{
 pub enum DataKey {
     Stream(u64),
     NextId,
+    ActiveStreamsCount,
 }
 
 #[contracttype]
@@ -41,6 +42,8 @@ pub struct Stream {
     pub withdrawn: i128,
     /// Whether the stream has been cancelled
     pub cancelled: bool,
+    /// Whether this stream is currently counted as active in the global counter
+    pub counted_active: bool,
 }
 
 #[contracttype]
@@ -137,6 +140,7 @@ impl ForgeStream {
             end_time: now + duration_seconds,
             withdrawn: 0,
             cancelled: false,
+            counted_active: true,
         };
 
         env.storage()
@@ -145,6 +149,8 @@ impl ForgeStream {
         env.storage()
             .instance()
             .set(&DataKey::NextId, &(stream_id + 1));
+
+        Self::set_active_streams_count(&env, Self::active_streams_count(&env).saturating_add(1));
 
         env.events().publish(
             (Symbol::new(&env, "stream_created"),),
@@ -266,6 +272,11 @@ impl ForgeStream {
         let total = stream.rate_per_second * (stream.end_time - stream.start_time) as i128;
         let returnable = total - streamed;
 
+        if stream.counted_active {
+            Self::set_active_streams_count(&env, Self::active_streams_count(&env).saturating_sub(1));
+            stream.counted_active = false;
+        }
+
         stream.cancelled = true;
         env.storage()
             .instance()
@@ -370,6 +381,15 @@ impl ForgeStream {
             .ok_or(StreamError::StreamNotFound)
     }
 
+    /// Return the number of currently active streams.
+    ///
+    /// Active streams are not cancelled and have not fully elapsed.
+    /// This method also synchronizes the counter for any streams that elapsed
+    /// since the last interaction.
+    pub fn get_active_streams_count(env: Env) -> u64 {
+        Self::sync_elapsed_streams(&env)
+    }
+
     /// Return the number of tokens the recipient can withdraw right now.
     ///
     /// Lightweight alternative to [`get_stream_status`](Self::get_stream_status)
@@ -402,6 +422,43 @@ impl ForgeStream {
         let effective_time = now.min(stream.end_time);
         let elapsed = effective_time.saturating_sub(stream.start_time);
         stream.rate_per_second * elapsed as i128
+    }
+
+    fn active_streams_count(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ActiveStreamsCount)
+            .unwrap_or(0_u64)
+    }
+
+    fn set_active_streams_count(env: &Env, count: u64) {
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveStreamsCount, &count);
+    }
+
+    fn sync_elapsed_streams(env: &Env) -> u64 {
+        let now = env.ledger().timestamp();
+        let next_id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0_u64);
+        let mut active_count = Self::active_streams_count(env);
+
+        let mut stream_id = 0_u64;
+        while stream_id < next_id {
+            let maybe_stream: Option<Stream> = env.storage().instance().get(&DataKey::Stream(stream_id));
+            if let Some(mut stream) = maybe_stream {
+                if stream.counted_active && !stream.cancelled && now >= stream.end_time {
+                    stream.counted_active = false;
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::Stream(stream_id), &stream);
+                    active_count = active_count.saturating_sub(1);
+                }
+            }
+            stream_id += 1;
+        }
+
+        Self::set_active_streams_count(env, active_count);
+        active_count
     }
 }
 
@@ -871,6 +928,66 @@ mod tests {
         // Verify the split sums to total
         assert_eq!(expected_withdrawable + expected_returnable, total);
         assert_eq!(status.streamed + status.remaining, total);
+    }
+
+    #[test]
+    fn test_active_streams_count_tracks_create_and_cancel() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(ForgeStream, ());
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let sac = StellarAssetClient::new(&env, &token_id);
+        sac.mint(&sender, &10_000_000i128);
+        let token = TokenClient::new(&env, &token_id);
+
+        assert_eq!(client.get_active_streams_count(), 0);
+
+        let stream_a = client.create_stream(&sender, &token.address, &recipient, &100, &1000);
+        assert_eq!(client.get_active_streams_count(), 1);
+
+        let stream_b = client.create_stream(&sender, &token.address, &recipient, &50, &800);
+        assert_eq!(client.get_active_streams_count(), 2);
+
+        client.cancel_stream(&stream_a);
+        assert_eq!(client.get_active_streams_count(), 1);
+
+        client.cancel_stream(&stream_b);
+        assert_eq!(client.get_active_streams_count(), 0);
+    }
+
+    #[test]
+    fn test_active_streams_count_decrements_on_full_elapsed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(ForgeStream, ());
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let sac = StellarAssetClient::new(&env, &token_id);
+        sac.mint(&sender, &10_000_000i128);
+        let token = TokenClient::new(&env, &token_id);
+
+        client.create_stream(&sender, &token.address, &recipient, &10, &100);
+        client.create_stream(&sender, &token.address, &recipient, &20, &300);
+        assert_eq!(client.get_active_streams_count(), 2);
+
+        env.ledger().with_mut(|l| l.timestamp += 150);
+        assert_eq!(client.get_active_streams_count(), 1);
+
+        env.ledger().with_mut(|l| l.timestamp += 200);
+        assert_eq!(client.get_active_streams_count(), 0);
     }
 }
 
