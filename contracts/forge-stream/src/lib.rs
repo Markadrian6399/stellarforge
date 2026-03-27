@@ -371,6 +371,9 @@ impl ForgeStream {
             return Err(StreamError::AlreadyCancelled);
         }
 
+        // Auth-first convention: verify sender authorization before checking stream state
+        stream.sender.require_auth();
+
         if env.ledger().timestamp() >= stream.end_time {
             return Err(StreamError::StreamFinished);
         }
@@ -378,8 +381,6 @@ impl ForgeStream {
         if stream.is_paused {
             return Err(StreamError::InvalidConfig); // Already paused
         }
-
-        stream.sender.require_auth();
 
         let now = env.ledger().timestamp();
         stream.is_paused = true;
@@ -422,6 +423,9 @@ impl ForgeStream {
             return Err(StreamError::AlreadyCancelled);
         }
 
+        // Auth-first convention: verify sender authorization before checking stream state
+        stream.sender.require_auth();
+
         if env.ledger().timestamp() >= stream.end_time {
             return Err(StreamError::StreamFinished);
         }
@@ -429,8 +433,6 @@ impl ForgeStream {
         if !stream.is_paused {
             return Err(StreamError::InvalidConfig); // Not paused
         }
-
-        stream.sender.require_auth();
 
         let now = env.ledger().timestamp();
         stream.total_paused_time += now.saturating_sub(stream.paused_at);
@@ -698,7 +700,7 @@ mod tests {
     use crate::ForgeStream;
 
     use super::*;
-    use soroban_sdk::Env;
+    use soroban_sdk::{Env, IntoVal};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         token::{Client as TokenClient, StellarAssetClient},
