@@ -1805,6 +1805,17 @@ mod tests {
     ///   - final cumulative withdrawn == rate_per_second * duration_seconds
     #[test]
     fn test_withdrawn_never_exceeds_streamed_across_multiple_withdrawals() {
+    /// Test that paused time is correctly excluded from streamed amount after resume.
+    ///
+    /// Timeline:
+    ///   t=0    stream created  (rate=100, duration=1000, total=100_000)
+    ///   t=100  pause           (streamed = 100 * 100 = 10_000)
+    ///   t=300  resume          (paused for 200s — those 200s must not count)
+    ///   t=400  check           (effective elapsed = 400 - 200 = 200s → streamed = 20_000)
+    ///   t=500  check           (effective elapsed = 500 - 200 = 300s → streamed = 30_000)
+    ///   t=1200 end of stream   (end_time extended by 200s to 1200; full 100_000 withdrawable)
+    #[test]
+    fn test_paused_time_excluded_from_streamed_after_resume() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -1869,5 +1880,57 @@ mod tests {
             "Final withdrawn {} != expected total {}",
             cumulative_withdrawn, total,
         );
+        // t=0: create stream
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let stream_id = client.create_stream(&sender, &token_id, &recipient, &rate, &duration);
+
+        // t=100: pause — 100s of active time → streamed = 10_000
+        env.ledger().with_mut(|l| l.timestamp = 100);
+        client.pause_stream(&stream_id);
+        let status = client.get_stream_status(&stream_id);
+        assert_eq!(status.streamed, 10_000, "streamed at pause should be 10_000");
+
+        // t=300: resume — paused for 200s
+        env.ledger().with_mut(|l| l.timestamp = 300);
+        client.resume_stream(&stream_id);
+
+        // t=400: effective elapsed = (400 - 0) - 200 paused = 200s → streamed = 20_000
+        env.ledger().with_mut(|l| l.timestamp = 400);
+        let status = client.get_stream_status(&stream_id);
+        assert_eq!(
+            status.streamed, 20_000,
+            "at t=400 streamed should be 20_000 (paused 200s excluded), got {}",
+            status.streamed
+        );
+        assert!(
+            status.withdrawn <= status.streamed,
+            "invariant violated: withdrawn {} > streamed {}",
+            status.withdrawn, status.streamed
+        );
+
+        // t=500: effective elapsed = (500 - 0) - 200 paused = 300s → streamed = 30_000
+        env.ledger().with_mut(|l| l.timestamp = 500);
+        let status = client.get_stream_status(&stream_id);
+        assert_eq!(
+            status.streamed, 30_000,
+            "at t=500 streamed should be 30_000 (paused 200s excluded), got {}",
+            status.streamed
+        );
+
+        // t=1200: end_time was extended by 200s (1000 + 200 = 1200)
+        // Full duration of active time has elapsed → all 100_000 tokens withdrawable
+        env.ledger().with_mut(|l| l.timestamp = 1200);
+        let status = client.get_stream_status(&stream_id);
+        assert_eq!(
+            status.streamed, total,
+            "at end of stream streamed should equal total {}, got {}",
+            total, status.streamed
+        );
+        assert_eq!(
+            status.withdrawable, total,
+            "full total should be withdrawable at stream end, got {}",
+            status.withdrawable
+        );
+        assert!(status.is_finished, "stream should be finished at t=1200");
     }
 }
