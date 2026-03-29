@@ -25,6 +25,7 @@ pub struct PricePair {
 pub enum DataKey {
     Admin,
     StalenessThreshold,
+    MaxDeviation,
     Price(PricePair),
     UpdatedAt(PricePair),
     Pairs,
@@ -64,6 +65,7 @@ pub enum OracleError {
     PriceStale = 5,
     InvalidPrice = 6,
     InvalidPair = 7,
+    PriceDeviationTooHigh = 8,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -142,6 +144,25 @@ impl ForgeOracle {
             quote: quote.clone(),
         };
         let now = env.ledger().timestamp();
+
+        // Circuit breaker: reject prices that deviate too far from the previous price
+        let max_deviation_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxDeviation)
+            .unwrap_or(0u32);
+        if max_deviation_bps > 0 {
+            if let Some(prev_price) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, i128>(&DataKey::Price(pair.clone()))
+            {
+                let deviation = (price - prev_price).abs() * 10_000 / prev_price;
+                if deviation > max_deviation_bps as i128 {
+                    return Err(OracleError::PriceDeviationTooHigh);
+                }
+            }
+        }
 
         // Track this pair in the known-pairs list (deduplicated by key)
         let pair_key = PricePair { base: base.clone(), quote: quote.clone() };
@@ -303,6 +324,32 @@ impl ForgeOracle {
             (old_admin, new_admin),
         );
 
+        Ok(())
+    }
+
+    /// Sets the maximum allowed price deviation for the circuit breaker.
+    ///
+    /// When set to a non-zero value, [`submit_price`](Self::submit_price) will reject any
+    /// new price that deviates more than `bps` basis points from the previously stored price
+    /// for the same pair. A value of `0` disables the circuit breaker (default).
+    ///
+    /// # Parameters
+    /// - `bps`: Maximum deviation in basis points (e.g. `1000` = 10%). `0` disables the check.
+    ///
+    /// # Errors
+    /// - [`OracleError::NotInitialized`] — contract not initialized
+    /// - [`OracleError::Unauthorized`] — caller is not the admin
+    pub fn set_max_price_deviation(env: Env, bps: u32) -> Result<(), OracleError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(OracleError::NotInitialized)?;
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxDeviation, &bps);
+        env.storage().instance().extend_ttl(17280, 34560);
         Ok(())
     }
 
@@ -1185,5 +1232,86 @@ mod tests {
         let contract_id = env.register_contract(None, ForgeOracle);
         let client = ForgeOracleClient::new(&env, &contract_id);
         assert_eq!(client.try_get_all_prices(), Err(Ok(OracleError::NotInitialized)));
+    }
+
+    // ── Circuit breaker tests ─────────────────────────────────────────────────
+
+    /// First submission is always accepted — no previous price to compare against.
+    #[test]
+    fn test_circuit_breaker_first_price_always_accepted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let (admin, client) = setup(&env);
+
+        // Set a tight 5% circuit breaker
+        client.set_max_price_deviation(&1000); // 10%
+
+        let base = Symbol::new(&env, "XLM");
+        let quote = Symbol::new(&env, "USDC");
+
+        // First submission — no previous price, must succeed regardless of value
+        let result = client.try_submit_price(&base, &quote, &10_000_000);
+        assert!(result.is_ok());
+        let _ = admin;
+    }
+
+    /// Price within the deviation threshold is accepted.
+    #[test]
+    fn test_circuit_breaker_within_threshold_accepted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let (_, client) = setup(&env);
+
+        client.set_max_price_deviation(&1000); // 10%
+
+        let base = Symbol::new(&env, "XLM");
+        let quote = Symbol::new(&env, "USDC");
+
+        client.submit_price(&base, &quote, &10_000_000); // 1.0
+
+        // 5% increase — within 10% threshold
+        let result = client.try_submit_price(&base, &quote, &10_500_000);
+        assert!(result.is_ok());
+    }
+
+    /// Price exceeding the deviation threshold is rejected.
+    #[test]
+    fn test_circuit_breaker_exceeds_threshold_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let (_, client) = setup(&env);
+
+        client.set_max_price_deviation(&1000); // 10%
+
+        let base = Symbol::new(&env, "XLM");
+        let quote = Symbol::new(&env, "USDC");
+
+        client.submit_price(&base, &quote, &10_000_000); // 1.0
+
+        // 20% increase — exceeds 10% threshold
+        let result = client.try_submit_price(&base, &quote, &12_000_000);
+        assert_eq!(result, Err(Ok(OracleError::PriceDeviationTooHigh)));
+    }
+
+    /// Zero deviation threshold disables the circuit breaker entirely.
+    #[test]
+    fn test_circuit_breaker_zero_bps_disabled() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let (_, client) = setup(&env);
+
+        // Default is 0 (disabled) — no need to call set_max_price_deviation
+        let base = Symbol::new(&env, "XLM");
+        let quote = Symbol::new(&env, "USDC");
+
+        client.submit_price(&base, &quote, &10_000_000);
+
+        // 10x price jump — should be accepted because circuit breaker is off
+        let result = client.try_submit_price(&base, &quote, &100_000_000);
+        assert!(result.is_ok());
     }
 }
