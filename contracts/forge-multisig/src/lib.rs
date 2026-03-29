@@ -10,7 +10,9 @@
 //! - Owners can propose, approve, reject, and execute transactions
 //! - Native token support via Stellar token interface
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, Vec,
+};
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -72,6 +74,7 @@ pub enum MultisigError {
     InsufficientApprovals = 9,
     InvalidThreshold = 10,
     InvalidAmount = 11,
+    CannotCancel = 12,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -222,7 +225,7 @@ impl MultisigContract {
         env.storage()
             .persistent()
             .set(&DataKey::NextProposalId, &(proposal_id + 1));
-        
+
         // Extend TTL for NextProposalId to prevent expiry (1 year)
         env.storage()
             .persistent()
@@ -354,6 +357,9 @@ impl MultisigContract {
         if proposal.executed {
             return Err(MultisigError::AlreadyExecuted);
         }
+        if proposal.cancelled {
+            return Err(MultisigError::AlreadyCancelled);
+        }
         if env
             .storage()
             .persistent()
@@ -459,6 +465,93 @@ impl MultisigContract {
         );
 
         Ok(())
+    }
+
+    /// Cancel a proposal that can no longer reach the approval threshold.
+    ///
+    /// Allows an owner to cancel a proposal if it is mathematically impossible
+    /// for it to reach the approval threshold, or if the proposer cancels before
+    /// execution. This helps clean up dead proposals and free storage.
+    /// Requires authorization from `owner`.
+    ///
+    /// # Parameters
+    /// - `owner` — An owner address requesting cancellation.
+    /// - `proposal_id` — ID of the proposal to cancel.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - [`MultisigError::Unauthorized`] — `owner` is not in the owner list.
+    /// - [`MultisigError::ProposalNotFound`] — No proposal exists with `proposal_id`.
+    /// - [`MultisigError::AlreadyExecuted`] — The proposal has already been executed.
+    /// - [`MultisigError::AlreadyCancelled`] — The proposal has already been cancelled.
+    /// - [`MultisigError::CannotCancel`] — The proposal can still reach the approval threshold.
+    ///
+    /// # Example
+    /// ```text
+    /// // Cancel a proposal that can no longer reach threshold
+    /// client.cancel(&owner_a, &proposal_id);
+    /// ```
+    pub fn cancel(env: Env, owner: Address, proposal_id: u64) -> Result<(), MultisigError> {
+        owner.require_auth();
+        Self::require_owner(&env, &owner)?;
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(MultisigError::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(MultisigError::AlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(MultisigError::AlreadyCancelled);
+        }
+
+        // Allow proposer to cancel at any time before execution
+        if proposal.proposer == owner {
+            proposal.cancelled = true;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Proposal(proposal_id), &proposal);
+
+            env.events().publish(
+                (Symbol::new(&env, "proposal_cancelled"),),
+                (proposal_id, &owner),
+            );
+
+            return Ok(());
+        }
+
+        // For other owners, only allow cancellation if mathematically impossible to pass
+        let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap();
+        let owners: Vec<Address> = env.storage().instance().get(&DataKey::Owners).unwrap();
+        let total_owners = owners.len();
+
+        // Calculate remaining possible approvals
+        // remaining_possible = total_owners - rejection_count - approval_count
+        let remaining_possible = total_owners
+            .saturating_sub(proposal.rejection_count)
+            .saturating_sub(proposal.approval_count);
+
+        // If remaining possible approvals < threshold, it's impossible to pass
+        if remaining_possible < threshold {
+            proposal.cancelled = true;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Proposal(proposal_id), &proposal);
+
+            env.events().publish(
+                (Symbol::new(&env, "proposal_cancelled"),),
+                (proposal_id, &owner),
+            );
+
+            return Ok(());
+        }
+
+        Err(MultisigError::CannotCancel)
     }
 
     /// Return a proposal by its ID.
@@ -972,7 +1065,11 @@ mod tests {
         let o1 = Address::generate(env);
         let o2 = Address::generate(env);
         let o3 = Address::generate(env);
-        client.initialize(&vec![env, o1.clone(), o2.clone(), o3.clone()], &2, &timelock_delay);
+        client.initialize(
+            &vec![env, o1.clone(), o2.clone(), o3.clone()],
+            &2,
+            &timelock_delay,
+        );
 
         let token_id = env
             .register_stellar_asset_contract_v2(Address::generate(env))
@@ -1116,7 +1213,14 @@ mod tests {
     /// Helper: 1-of-3 multisig with a 3600 s timelock and a funded token.
     fn setup_1of3_funded<'a>(
         env: &'a Env,
-    ) -> (MultisigContractClient<'a>, Address, Address, Address, Address, Address) {
+    ) -> (
+        MultisigContractClient<'a>,
+        Address,
+        Address,
+        Address,
+        Address,
+        Address,
+    ) {
         let contract_id = env.register_contract(None, MultisigContract);
         let client = MultisigContractClient::new(env, &contract_id);
         let o1 = Address::generate(env);
@@ -1273,8 +1377,7 @@ mod tests {
         const TRANSFER_AMOUNT: i128 = 250;
         const FUNDED_AMOUNT: i128 = 1000;
 
-        let (client, [o1, o2, o3], token_id, recipient, contract_id) =
-            setup_funded(&env, TIMELOCK);
+        let (client, [o1, o2, o3], token_id, recipient, contract_id) = setup_funded(&env, TIMELOCK);
 
         let token = soroban_sdk::token::Client::new(&env, &token_id);
 
@@ -1438,6 +1541,143 @@ mod tests {
         assert!(found, "Expected proposal_rejected event not found");
     }
 
+    /// Test that reject() on a cancelled proposal reverts with AlreadyCancelled
+    #[test]
+    fn test_reject_on_cancelled_proposal_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, o2, o3) = setup_2of3(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        let pid = client.propose(&o1, &to, &token, &500);
+
+        // Cancel the proposal
+        client.cancel(&o1, &pid);
+
+        // Try to reject the cancelled proposal
+        let result = client.try_reject(&o2, &pid);
+        assert_eq!(result, Err(Ok(MultisigError::AlreadyCancelled)));
+
+        // Verify proposal is still cancelled
+        let proposal = client.get_proposal(&pid).unwrap();
+        assert!(proposal.cancelled);
+    }
+
+    /// Test that proposer can cancel their own proposal before execution
+    #[test]
+    fn test_proposer_can_cancel_own_proposal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, o2, o3) = setup_2of3(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        let pid = client.propose(&o1, &to, &token, &500);
+
+        // Proposer cancels their own proposal
+        let result = client.try_cancel(&o1, &pid);
+        assert!(result.is_ok());
+
+        // Verify proposal is cancelled
+        let proposal = client.get_proposal(&pid).unwrap();
+        assert!(proposal.cancelled);
+    }
+
+    /// Test that non-proposer can cancel a proposal that can no longer reach threshold
+    #[test]
+    fn test_non_proposer_can_cancel_dead_proposal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, o2, o3) = setup_2of3(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        let pid = client.propose(&o1, &to, &token, &500);
+
+        // o2 rejects, making it impossible to reach threshold (2 approvals needed, only 1 possible)
+        client.reject(&o2, &pid);
+
+        // o3 can cancel because remaining possible approvals (1) < threshold (2)
+        let result = client.try_cancel(&o3, &pid);
+        assert!(result.is_ok());
+
+        // Verify proposal is cancelled
+        let proposal = client.get_proposal(&pid).unwrap();
+        assert!(proposal.cancelled);
+    }
+
+    /// Test that non-proposer cannot cancel a proposal that can still reach threshold
+    #[test]
+    fn test_non_proposer_cannot_cancel_active_proposal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, o2, o3) = setup_2of3(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        let pid = client.propose(&o1, &to, &token, &500);
+
+        // o2 tries to cancel, but proposal can still reach threshold
+        let result = client.try_cancel(&o2, &pid);
+        assert_eq!(result, Err(Ok(MultisigError::CannotCancel)));
+
+        // Verify proposal is not cancelled
+        let proposal = client.get_proposal(&pid).unwrap();
+        assert!(!proposal.cancelled);
+    }
+
+    /// Test that cancel() on an already cancelled proposal reverts with AlreadyCancelled
+    #[test]
+    fn test_cancel_already_cancelled_proposal_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, o2, o3) = setup_2of3(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        let pid = client.propose(&o1, &to, &token, &500);
+
+        // Cancel the proposal
+        client.cancel(&o1, &pid);
+
+        // Try to cancel again
+        let result = client.try_cancel(&o1, &pid);
+        assert_eq!(result, Err(Ok(MultisigError::AlreadyCancelled)));
+    }
+
+    /// Test that cancel() on an executed proposal reverts with AlreadyExecuted
+    #[test]
+    fn test_cancel_executed_proposal_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+
+        let contract_id = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_id);
+        let o1 = Address::generate(&env);
+        let o2 = Address::generate(&env);
+        let o3 = Address::generate(&env);
+        client.initialize(&vec![&env, o1.clone(), o2.clone(), o3.clone()], &2, &3600);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let to = Address::generate(&env);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&contract_id, &500);
+
+        let pid = client.propose(&o1, &to, &token_id, &500);
+        client.approve(&o2, &pid);
+
+        env.ledger().with_mut(|l| l.timestamp = 7200);
+        client.execute(&o3, &pid);
+
+        // Try to cancel the executed proposal
+        let result = client.try_cancel(&o1, &pid);
+        assert_eq!(result, Err(Ok(MultisigError::AlreadyExecuted)));
+    }
+
     /// Test that execute() emits a proposal_executed event with correct payload
     #[test]
     fn test_execute_emits_event() {
@@ -1454,7 +1694,9 @@ mod tests {
         client.initialize(&vec![&env, o1.clone(), o2.clone(), o3.clone()], &2, &3600);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         let to = Address::generate(&env);
         soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&contract_id, &500);
 
@@ -1510,7 +1752,10 @@ mod tests {
 
         // A freshly generated address must NOT be an owner
         let non_owner = Address::generate(&env);
-        assert!(!client.is_owner(&non_owner), "Expected address to not be an owner");
+        assert!(
+            !client.is_owner(&non_owner),
+            "Expected address to not be an owner"
+        );
 
         // get_owners() must still return all 10
         assert_eq!(client.get_owners().len(), 10);

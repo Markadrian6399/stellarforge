@@ -191,9 +191,10 @@ impl ForgeStream {
             .get(&DataKey::RecipientStreams(recipient.clone()))
             .unwrap_or(soroban_sdk::Vec::new(&env));
         recipient_streams.push_back(stream_id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::RecipientStreams(recipient.clone()), &recipient_streams);
+        env.storage().persistent().set(
+            &DataKey::RecipientStreams(recipient.clone()),
+            &recipient_streams,
+        );
         // Extend TTL for recipient streams mapping
         env.storage()
             .persistent()
@@ -239,6 +240,7 @@ impl ForgeStream {
     /// - `AlreadyCancelled`
     /// - `NothingToWithdraw`
     pub fn withdraw(env: Env, stream_id: u64) -> Result<i128, StreamError> {
+        Self::validate_stream_id(&env, stream_id)?;
         let mut stream: Stream = env
             .storage()
             .persistent()
@@ -306,6 +308,7 @@ impl ForgeStream {
     /// - `Unauthorized` (not sender)
     /// - `AlreadyCancelled`
     pub fn cancel_stream(env: Env, stream_id: u64) -> Result<(), StreamError> {
+        Self::validate_stream_id(&env, stream_id)?;
         let mut stream: Stream = env
             .storage()
             .persistent()
@@ -387,6 +390,7 @@ impl ForgeStream {
     /// - `StreamFinished`
     /// - `InvalidConfig` (already paused)
     pub fn pause_stream(env: Env, stream_id: u64) -> Result<(), StreamError> {
+        Self::validate_stream_id(&env, stream_id)?;
         let mut stream: Stream = env
             .storage()
             .persistent()
@@ -446,6 +450,7 @@ impl ForgeStream {
     /// - `StreamFinished`
     /// - `InvalidConfig` (not paused)
     pub fn resume_stream(env: Env, stream_id: u64) -> Result<(), StreamError> {
+        Self::validate_stream_id(&env, stream_id)?;
         let mut stream: Stream = env
             .storage()
             .persistent()
@@ -514,6 +519,7 @@ impl ForgeStream {
     /// }
     /// ```rust,ignore
     pub fn get_stream_status(env: Env, stream_id: u64) -> Result<StreamStatus, StreamError> {
+        Self::validate_stream_id(&env, stream_id)?;
         let stream: Stream = env
             .storage()
             .persistent()
@@ -562,6 +568,7 @@ impl ForgeStream {
     /// # Errors
     /// - `StreamNotFound`
     pub fn get_stream(env: Env, stream_id: u64) -> Result<Stream, StreamError> {
+        Self::validate_stream_id(&env, stream_id)?;
         env.storage()
             .persistent()
             .get(&DataKey::Stream(stream_id))
@@ -596,10 +603,7 @@ impl ForgeStream {
     /// }
     /// ```
     pub fn get_stream_count(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::NextId)
-            .unwrap_or(0)
+        env.storage().instance().get(&DataKey::NextId).unwrap_or(0)
     }
 
     /// Return the number of tokens the recipient can withdraw right now.
@@ -695,6 +699,30 @@ impl ForgeStream {
 
     // ── Private ───────────────────────────────────────────────────────────────
 
+    /// Validate that a stream ID is within the valid range.
+    ///
+    /// Checks that `stream_id < NextId` before attempting to read from storage.
+    /// This provides an early, descriptive error and reduces storage read costs
+    /// on invalid IDs.
+    ///
+    /// # Parameters
+    /// - `env`: Reference to the Soroban environment
+    /// - `stream_id`: The stream ID to validate
+    ///
+    /// # Returns
+    /// `Ok(())` if valid, `Err(StreamError::StreamNotFound)` if out of range
+    fn validate_stream_id(env: &Env, stream_id: u64) -> Result<(), StreamError> {
+        let next_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(0_u64);
+        if stream_id >= next_id {
+            return Err(StreamError::StreamNotFound);
+        }
+        Ok(())
+    }
+
     fn compute_streamed(stream: &Stream, now: u64) -> i128 {
         if stream.cancelled {
             return stream.streamed_at_cancel;
@@ -743,9 +771,11 @@ impl ForgeStream {
                     env.storage()
                         .persistent()
                         .set(&DataKey::Stream(stream_id), &stream);
-                    env.storage()
-                        .persistent()
-                        .extend_ttl(&DataKey::Stream(stream_id), 17280, 34560);
+                    env.storage().persistent().extend_ttl(
+                        &DataKey::Stream(stream_id),
+                        17280,
+                        34560,
+                    );
                     active_count = active_count.saturating_sub(1);
                 }
             }
@@ -763,11 +793,11 @@ mod tests {
     use crate::ForgeStream;
 
     use super::*;
-    use soroban_sdk::{Env, IntoVal};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         token::{Client as TokenClient, StellarAssetClient},
     };
+    use soroban_sdk::{Env, IntoVal};
 
     fn setup_token(env: &Env, sender: &Address, total: i128) -> Address {
         let token_admin = Address::generate(env);
@@ -897,23 +927,23 @@ mod tests {
         let token = TokenClient::new(&env, &token_id);
 
         let stream_id = client.create_stream(&sender, &token.address, &recipient, &100, &1000);
-        
+
         // Advance time by 100 seconds so tokens accrue
         env.ledger().with_mut(|l| l.timestamp += 100);
-        
+
         // First withdraw should succeed and return 100 * 100 = 10,000
         let withdrawn_amount = client.withdraw(&stream_id);
         assert_eq!(withdrawn_amount, 10_000);
-        
+
         // Verify stream status after first withdrawal
         let status_after_first = client.get_stream_status(&stream_id);
         assert_eq!(status_after_first.withdrawn, 10_000);
         assert_eq!(status_after_first.withdrawable, 0);
-        
+
         // Second withdraw without advancing time should fail with NothingToWithdraw
         let result = client.try_withdraw(&stream_id);
         assert_eq!(result, Err(Ok(StreamError::NothingToWithdraw)));
-        
+
         // Verify stream status hasn't changed
         let status_after_second = client.get_stream_status(&stream_id);
         assert_eq!(status_after_second.withdrawn, 10_000);
@@ -1133,7 +1163,9 @@ mod tests {
         let recipient = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_000i128);
 
         let stream_id = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
@@ -1152,7 +1184,9 @@ mod tests {
         let recipient = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_000i128);
 
         let stream_id = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
@@ -1171,7 +1205,9 @@ mod tests {
         let recipient = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_000i128);
 
         let stream_id = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
@@ -1362,28 +1398,28 @@ mod tests {
 
         // Create stream: 100 tokens/sec for 1000 seconds = 100,000 total
         let stream_id = client.create_stream(&sender, &token, &recipient, &100, &1000);
-        
+
         // Advance 100 seconds, then pause
         env.ledger().with_mut(|l| l.timestamp += 100);
         client.pause_stream(&stream_id);
-        
+
         // Check status after pause
         let status_paused = client.get_stream_status(&stream_id);
         assert_eq!(status_paused.streamed, 10_000); // 100 * 100
-        
+
         // Advance 200 seconds while paused (no accrual)
         env.ledger().with_mut(|l| l.timestamp += 200);
-        
+
         // Resume (extends end_time by 200 seconds)
         client.resume_stream(&stream_id);
-        
+
         // Check status after resume
         let status_resumed = client.get_stream_status(&stream_id);
         assert_eq!(status_resumed.streamed, 10_000); // Still 100 * 100
-        
+
         // Advance to new end_time (1200)
         env.ledger().with_mut(|l| l.timestamp += 900);
-        
+
         let status = client.get_stream_status(&stream_id);
         // Total streamed should be 100 * 1000 = 100,000 (full amount)
         // Calculation: raw_elapsed = 1200 - 0 = 1200, paused_time = 200
@@ -1526,7 +1562,9 @@ mod tests {
         let recipient = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&sender, &1_000_000);
 
         assert_eq!(client.get_stream_count(), 0);
@@ -1551,7 +1589,9 @@ mod tests {
         let recipient = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&sender, &1_000_000);
 
         let stream_id = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
@@ -1595,7 +1635,9 @@ mod tests {
         let recipient = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_000i128);
 
         let stream_id = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
@@ -1615,7 +1657,9 @@ mod tests {
         let recipient = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_000i128);
 
         let stream_id = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
@@ -1636,7 +1680,9 @@ mod tests {
         let recipient2 = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_000i128);
 
         let stream_id1 = client.create_stream(&sender, &token_id, &recipient1, &100, &1000);
@@ -1659,7 +1705,9 @@ mod tests {
         let recipient = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         StellarAssetClient::new(&env, &token_id).mint(&sender1, &10_000_000i128);
         StellarAssetClient::new(&env, &token_id).mint(&sender2, &10_000_000i128);
 
@@ -1682,7 +1730,9 @@ mod tests {
         let recipient = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_000i128);
 
         let stream_id1 = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
@@ -1713,7 +1763,9 @@ mod tests {
         let recipient2 = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         StellarAssetClient::new(&env, &token_id).mint(&sender1, &10_000_000i128);
         StellarAssetClient::new(&env, &token_id).mint(&sender2, &10_000_000i128);
 
@@ -1748,7 +1800,9 @@ mod tests {
         let recipient = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_000i128);
 
         let stream_id = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
@@ -1761,7 +1815,10 @@ mod tests {
         client.cancel_stream(&stream_id);
 
         let status_after = client.get_stream_status(&stream_id);
-        assert_eq!(status_after.streamed, 20_000, "streamed should equal the amount at cancel time");
+        assert_eq!(
+            status_after.streamed, 20_000,
+            "streamed should equal the amount at cancel time"
+        );
         // After cancel, tokens are auto-paid out so withdrawable reflects unpaid accrued amount
         // (withdrawn is not updated on cancel — the transfer happens directly)
         assert_eq!(status_after.is_active, false);
@@ -1777,7 +1834,9 @@ mod tests {
         let sender = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         StellarAssetClient::new(&env, &token_id).mint(&sender, &2_500_000_000i128);
 
         let mut stream_ids = soroban_sdk::Vec::new(&env);
@@ -1795,7 +1854,8 @@ mod tests {
             assert_eq!(
                 sender_streams.get(i).unwrap(),
                 stream_ids.get(i).unwrap(),
-                "Stream ID at index {} does not match", i
+                "Stream ID at index {} does not match",
+                i
             );
         }
     }
@@ -1811,7 +1871,9 @@ mod tests {
         let recipient = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         let sac = StellarAssetClient::new(&env, &token_id);
         let token = TokenClient::new(&env, &token_id);
 
@@ -1842,6 +1904,72 @@ mod tests {
     ///   - final cumulative withdrawn == rate_per_second * duration_seconds
     #[test]
     fn test_withdrawn_never_exceeds_streamed_across_multiple_withdrawals() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let sac = StellarAssetClient::new(&env, &token_id);
+
+        let rate: i128 = 100;
+        let duration: u64 = 1000;
+        let total = rate * duration as i128; // 100_000
+
+        sac.mint(&sender, &total);
+
+        // Start at t=0
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let stream_id = client.create_stream(&sender, &token_id, &recipient, &rate, &duration);
+
+        let checkpoints: [(u64, u64); 5] = [
+            (100, 100),   // 10% of duration
+            (250, 250),   // 25%
+            (500, 500),   // 50%
+            (750, 750),   // 75%
+            (1000, 1000), // 100%
+        ];
+
+        let mut cumulative_withdrawn: i128 = 0;
+
+        for (timestamp, _pct) in checkpoints.iter() {
+            env.ledger().with_mut(|l| l.timestamp = *timestamp);
+
+            let amount = client.withdraw(&stream_id);
+            cumulative_withdrawn += amount;
+
+            let status = client.get_stream_status(&stream_id);
+
+            // Core invariant: withdrawn must never exceed streamed
+            assert!(
+                status.withdrawn <= status.streamed,
+                "Invariant violated at t={}: withdrawn ({}) > streamed ({})",
+                timestamp,
+                status.withdrawn,
+                status.streamed,
+            );
+
+            // Cumulative return values must match stored withdrawn
+            assert_eq!(
+                status.withdrawn, cumulative_withdrawn,
+                "Cumulative mismatch at t={}: status.withdrawn={} vs sum={}",
+                timestamp, status.withdrawn, cumulative_withdrawn,
+            );
+        }
+
+        // After full duration: total withdrawn must equal rate * duration
+        assert_eq!(
+            cumulative_withdrawn, total,
+            "Final withdrawn {} != expected total {}",
+            cumulative_withdrawn, total,
+        );
+    }
+
     /// Test that paused time is correctly excluded from streamed amount after resume.
     ///
     /// Timeline:
@@ -1863,7 +1991,9 @@ mod tests {
         let recipient = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         let sac = StellarAssetClient::new(&env, &token_id);
 
         let rate: i128 = 100;
@@ -1925,7 +2055,10 @@ mod tests {
         env.ledger().with_mut(|l| l.timestamp = 100);
         client.pause_stream(&stream_id);
         let status = client.get_stream_status(&stream_id);
-        assert_eq!(status.streamed, 10_000, "streamed at pause should be 10_000");
+        assert_eq!(
+            status.streamed, 10_000,
+            "streamed at pause should be 10_000"
+        );
 
         // t=300: resume — paused for 200s
         env.ledger().with_mut(|l| l.timestamp = 300);
@@ -1942,7 +2075,8 @@ mod tests {
         assert!(
             status.withdrawn <= status.streamed,
             "invariant violated: withdrawn {} > streamed {}",
-            status.withdrawn, status.streamed
+            status.withdrawn,
+            status.streamed
         );
 
         // t=500: effective elapsed = (500 - 0) - 200 paused = 300s → streamed = 30_000
@@ -1969,5 +2103,153 @@ mod tests {
             status.withdrawable
         );
         assert!(status.is_finished, "stream should be finished at t=1200");
+    }
+
+    // ── Stream ID validation tests ─────────────────────────────────────────────
+
+    /// Test that get_stream() returns StreamNotFound for out-of-range stream ID.
+    #[test]
+    fn test_get_stream_out_of_range_returns_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+
+        // No streams created, so any ID should be out of range
+        let result = client.try_get_stream(&0);
+        assert!(result.is_err(), "Expected error for out-of-range stream ID");
+
+        let result = client.try_get_stream(&999);
+        assert!(result.is_err(), "Expected error for out-of-range stream ID");
+    }
+
+    /// Test that get_stream_status() returns StreamNotFound for out-of-range stream ID.
+    #[test]
+    fn test_get_stream_status_out_of_range_returns_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+
+        // No streams created, so any ID should be out of range
+        let result = client.try_get_stream_status(&0);
+        assert!(result.is_err(), "Expected error for out-of-range stream ID");
+
+        let result = client.try_get_stream_status(&999);
+        assert!(result.is_err(), "Expected error for out-of-range stream ID");
+    }
+
+    /// Test that withdraw() returns StreamNotFound for out-of-range stream ID.
+    #[test]
+    fn test_withdraw_out_of_range_returns_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+
+        // No streams created, so any ID should be out of range
+        let result = client.try_withdraw(&0);
+        assert_eq!(result, Err(Ok(StreamError::StreamNotFound)));
+
+        let result = client.try_withdraw(&999);
+        assert_eq!(result, Err(Ok(StreamError::StreamNotFound)));
+    }
+
+    /// Test that cancel_stream() returns StreamNotFound for out-of-range stream ID.
+    #[test]
+    fn test_cancel_stream_out_of_range_returns_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+
+        // No streams created, so any ID should be out of range
+        let result = client.try_cancel_stream(&0);
+        assert_eq!(result, Err(Ok(StreamError::StreamNotFound)));
+
+        let result = client.try_cancel_stream(&999);
+        assert_eq!(result, Err(Ok(StreamError::StreamNotFound)));
+    }
+
+    /// Test that pause_stream() returns StreamNotFound for out-of-range stream ID.
+    #[test]
+    fn test_pause_stream_out_of_range_returns_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+
+        // No streams created, so any ID should be out of range
+        let result = client.try_pause_stream(&0);
+        assert_eq!(result, Err(Ok(StreamError::StreamNotFound)));
+
+        let result = client.try_pause_stream(&999);
+        assert_eq!(result, Err(Ok(StreamError::StreamNotFound)));
+    }
+
+    /// Test that resume_stream() returns StreamNotFound for out-of-range stream ID.
+    #[test]
+    fn test_resume_stream_out_of_range_returns_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+
+        // No streams created, so any ID should be out of range
+        let result = client.try_resume_stream(&0);
+        assert_eq!(result, Err(Ok(StreamError::StreamNotFound)));
+
+        let result = client.try_resume_stream(&999);
+        assert_eq!(result, Err(Ok(StreamError::StreamNotFound)));
+    }
+
+    /// Test that validation does not false-positive on valid stream IDs.
+    #[test]
+    fn test_valid_stream_id_passes_validation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_000i128);
+
+        // Create a stream (ID 0)
+        let stream_id = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
+        assert_eq!(stream_id, 0);
+
+        // All functions should work with valid stream ID
+        let stream = client.get_stream(&stream_id);
+        assert_eq!(stream.id, stream_id);
+
+        let status = client.get_stream_status(&stream_id);
+        assert_eq!(status.id, stream_id);
+
+        // Advance time so tokens accrue
+        env.ledger().with_mut(|l| l.timestamp += 100);
+
+        // withdraw should work
+        let withdrawn = client.withdraw(&stream_id);
+        assert_eq!(withdrawn, 10_000);
+
+        // Create another stream (ID 1)
+        let stream_id_2 = client.create_stream(&sender, &token_id, &recipient, &50, &800);
+        assert_eq!(stream_id_2, 1);
+
+        // Both streams should be accessible
+        let stream_1 = client.get_stream(&stream_id);
+        assert_eq!(stream_1.id, stream_id);
+
+        let stream_2 = client.get_stream(&stream_id_2);
+        assert_eq!(stream_2.id, stream_id_2);
+
+        // Out of range ID should fail
+        let result = client.try_get_stream(&2);
+        assert!(result.is_err(), "Expected error for out-of-range stream ID");
     }
 }

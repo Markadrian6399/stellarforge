@@ -45,6 +45,7 @@ Soroban charges fees based on:
 ## Known Limitations
 
 - No vote delegation
+- **Front-running protection:** The `initialize()` function requires authorization from the `admin` address specified in the `GovernorConfig`. This prevents an attacker from monitoring the mempool and front-running the deployer's initialization with a malicious configuration (e.g., quorum = 1, timelock = 0). The admin address must authorize the initialization call via `require_auth()`.
 
 ---
 
