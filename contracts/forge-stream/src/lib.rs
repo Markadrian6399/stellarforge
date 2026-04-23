@@ -95,6 +95,9 @@ pub enum StreamError {
     AlreadyCancelled = 4,
     InvalidConfig = 5,
     StreamFinished = 6,
+    /// Sender's token balance is less than the total required to fund the stream
+    /// (`rate_per_second * duration_seconds`).
+    InsufficientFunds = 7,
 }
 
 #[contract]
@@ -131,6 +134,7 @@ impl ForgeStream {
     ///
     /// # Errors
     /// - `InvalidConfig` if rate <= 0 or duration == 0
+    /// - `InsufficientFunds` if sender balance < rate_per_second * duration_seconds
     pub fn create_stream(
         env: Env,
         sender: Address,
@@ -156,6 +160,9 @@ impl ForgeStream {
 
         // Pull total tokens from sender into contract
         let token_client = token::Client::new(&env, &token);
+        if token_client.balance(&sender) < total {
+            return Err(StreamError::InsufficientFunds);
+        }
         token_client.transfer(&sender, &env.current_contract_address(), &total);
 
         let stream = Stream {
@@ -991,6 +998,21 @@ mod tests {
 
         let result = client.try_create_stream(&sender, &token, &recipient, &0, &1000);
         assert_eq!(result, Err(Ok(StreamError::InvalidConfig)));
+    }
+
+    #[test]
+    fn test_create_stream_insufficient_funds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // Mint only 999 tokens but the stream needs 100 * 10 = 1000
+        let token_id = setup_token(&env, &sender, 999);
+
+        let result = client.try_create_stream(&sender, &token_id, &recipient, &100, &10);
+        assert_eq!(result, Err(Ok(StreamError::InsufficientFunds)));
     }
 
     #[test]
