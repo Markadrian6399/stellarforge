@@ -283,8 +283,6 @@ impl GovernorContract {
     ///
     /// Adds `weight` to `votes_for`, `votes_against`, or `abstentions` depending on
     /// `direction`. Each address may only vote once per proposal.
-    /// Adds `weight` to either `votes_for` or `votes_against` depending on
-    /// `support`. Each address may only vote once per proposal.
     ///
     /// The `weight` parameter is validated against the voter's actual on-chain
     /// token balance at the time of the call. If `weight` exceeds the voter's
@@ -319,7 +317,7 @@ impl GovernorContract {
     /// client.vote(&voter, &proposal_id, &VoteDirection::Abstain, &200);
     /// // Vote in favor with weight equal to the voter's token balance
     /// let balance = token_client.balance(&voter);
-    /// client.vote(&voter, &proposal_id, &true, &balance);
+    /// client.vote(&voter, &proposal_id, &VoteDirection::For, &balance);
     /// ```
     pub fn vote(
         env: Env,
@@ -363,19 +361,6 @@ impl GovernorContract {
         }
 
         if weight <= 0 {
-            return Err(GovernorError::InvalidWeight);
-        }
-
-        let config: GovernorConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config)
-            .ok_or(GovernorError::NotInitialized)?;
-
-        let token_client = token::Client::new(&env, &config.vote_token);
-        let actual_balance = token_client.balance(&voter);
-
-        if weight > actual_balance {
             return Err(GovernorError::InvalidWeight);
         }
 
@@ -2478,5 +2463,40 @@ mod tests {
             client.get_config().is_none(),
             "config should not be set after failed initialize"
         );
+    }
+
+    #[test]
+    fn test_get_config_returns_none_before_initialize_and_correct_config_after() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // Register the contract without calling initialize()
+        let contract_id = env.register_contract(None, GovernorContract);
+        let client = GovernorContractClient::new(&env, &contract_id);
+
+        // get_config() must return None before initialization
+        assert!(client.get_config().is_none());
+
+        // Build a known config
+        let admin = Address::generate(&env);
+        let vote_token = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        let config = GovernorConfig {
+            admin: admin.clone(),
+            vote_token: vote_token.clone(),
+            voting_period: 7200,
+            quorum: 50,
+            timelock_delay: 43200,
+        };
+
+        client.initialize(&config);
+
+        // get_config() must return Some with the exact values passed to initialize()
+        let stored = client.get_config().expect("config should be Some after initialize");
+        assert_eq!(stored.vote_token, vote_token);
+        assert_eq!(stored.voting_period, 7200);
+        assert_eq!(stored.quorum, 50);
+        assert_eq!(stored.timelock_delay, 43200);
     }
 }
